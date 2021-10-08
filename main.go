@@ -111,9 +111,15 @@ func setTheme(themeMode uint32) {
 	if err := k.SetDWordValue(REGNAME_TASKBAR_TRAY, themeMode); err != nil {
 		log.Fatal(err)
 	}
+
+	if err := k.SetDWordValue(REGNAME_APP_LIGHT_THEME, themeMode); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := k.Close(); err != nil {
 		log.Fatal(err)
 	}
+
 }
 
 func monitor(fn func(bool)) {
