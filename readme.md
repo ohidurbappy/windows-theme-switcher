@@ -5,7 +5,11 @@ switch the taskbar theme on windows.
 
 To use it download the `exe` file from the `release` section
 and place the `assets` folder in the same directory as the 
-`exe`. Now add it to startup from task manager.
+`exe`. 
+
+Now Open Run (CTRL+R) and put `shell:startup` and Enter
+
+Create a shortcut to the `exe` in here.
 
 
 
