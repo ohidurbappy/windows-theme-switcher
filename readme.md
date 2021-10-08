@@ -28,7 +28,7 @@ To build run:
 
 #### Preview
 
-![Preview](preview.png)
+![Preview](preview.gif)
 
 Todo:
 
