@@ -11,6 +11,8 @@ switch the taskbar theme on windows.
 
 ### How to use:
 
+#### Option 1: Use the binary
+
 Download the 'Windows.Theme.Switcher.exe' from the release section.
 Put it in "c:\" or any other drive. Now run it. That's it.
 It will automatically start with windows.
@@ -28,7 +30,7 @@ Now Open Run (CTRL+R) and put `shell:startup` and Enter
 
 Create a shortcut to the `exe` in here. -->
 
-### Build it yourself
+#### Option 2: Build it yourself
 
 Install the necessary dependencies
 
