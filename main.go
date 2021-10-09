@@ -1,9 +1,12 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -13,10 +16,18 @@ import (
 )
 
 const (
-	REGKEY                  = `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` // in HKCU
-	REGNAME_TASKBAR_TRAY    = `SystemUsesLightTheme`
-	REGNAME_APP_LIGHT_THEME = `AppsUseLightTheme`
+	REGKEY_THEME_PERSONALIZE = `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` // in HKCU
+	REGKEY_AUTORUN           = `SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
+	REGNAME_TASKBAR_TRAY     = `SystemUsesLightTheme`
+	REGNAME_APP_LIGHT_THEME  = `AppsUseLightTheme`
+	APPNAME                  = `Windows Theme Switcher`
 )
+
+//go:embed assets/dark_mode.ico
+var dark_mode []byte
+
+//go:embed assets/light_mode.ico
+var light_mode []byte
 
 func main() {
 	fmt.Println("Dark Mode on:", isDark())
@@ -27,10 +38,16 @@ func main() {
 
 func onReady() {
 
+	if !isSetAutoRun() {
+		SetAutoRun(true)
+	}
+
 	if isDark() {
-		systray.SetIcon(getIcon("assets/light_mode.ico"))
+		// systray.SetIcon(getIcon("assets/light_mode.ico"))
+		systray.SetIcon(light_mode)
 	} else {
-		systray.SetIcon(getIcon("assets/dark_mode.ico"))
+		// systray.SetIcon(getIcon("assets/dark_mode.ico"))
+		systray.SetIcon(dark_mode)
 	}
 
 	systray.SetTitle("Theme Switch")
@@ -74,16 +91,16 @@ func getIcon(s string) []byte {
 // react to the change
 func react(isDark bool) {
 	if isDark {
-		systray.SetIcon(getIcon("assets/light_mode.ico"))
+		systray.SetIcon(light_mode)
 
 	} else {
-		systray.SetIcon(getIcon("assets/dark_mode.ico"))
+		systray.SetIcon(dark_mode)
 
 	}
 }
 
 func isDark() bool {
-	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY, registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_THEME_PERSONALIZE, registry.QUERY_VALUE)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,7 +121,7 @@ func setLightModeTheme() {
 }
 
 func setTheme(themeMode uint32) {
-	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY, registry.QUERY_VALUE|registry.SET_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_THEME_PERSONALIZE, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -135,7 +152,7 @@ func monitor(fn func(bool)) {
 	}
 	if regNotifyChangeKeyValue != nil {
 		go func() {
-			k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY, syscall.KEY_NOTIFY|registry.QUERY_VALUE)
+			k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_THEME_PERSONALIZE, syscall.KEY_NOTIFY|registry.QUERY_VALUE)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -174,4 +191,51 @@ func getClockTime(tz string) string {
 func ItoaTwoDigits(i int) string {
 	b := "0" + strconv.Itoa(i)
 	return b[len(b)-2:]
+}
+
+// add to autorun
+func SetAutoRun(run bool) error {
+
+	ex, err := os.Executable()
+
+	if err != nil {
+		panic(err)
+	}
+	// executable_path=filepath.Dir(ex)
+	// get the real path if it is a symlink
+	exReal, err := filepath.EvalSymlinks(ex)
+	if err != nil {
+		panic(err)
+	}
+
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_AUTORUN, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if run {
+		if err := k.SetStringValue(APPNAME, exReal); err != nil {
+			return err
+		}
+	} else {
+		k.DeleteValue(APPNAME)
+	}
+	return nil
+}
+
+func isSetAutoRun() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_AUTORUN, registry.QUERY_VALUE)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer k.Close()
+	_, _, err = k.GetStringValue(APPNAME)
+
+	if err == registry.ErrNotExist {
+		// the key value doesn't exit
+		return false
+	}
+
+	return true
+
 }

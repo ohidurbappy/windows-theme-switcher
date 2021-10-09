@@ -3,15 +3,32 @@
 This program will appear on the system tray and help
 switch the taskbar theme on windows.
 
-To use it download the `exe` file from the `release` section
+
+#### Preview
+
+![Preview](preview.gif)
+
+
+### How to use:
+
+Download the 'Windows.Theme.Switcher.exe' from the release section.
+Put it in "c:\" or any other drive. Now run it. That's it.
+It will automatically start with windows.
+
+
+`OS: Windows 10, 11`
+
+[Download](https://github.com/ohidurbappy/windows-theme-switcher/releases/latest/download/Windows.Theme.Switcher.exe)
+
+<!-- To use it download the `exe` file from the `release` section
 and place the `assets` folder in the same directory as the 
 `exe`. 
 
 Now Open Run (CTRL+R) and put `shell:startup` and Enter
 
-Create a shortcut to the `exe` in here.
+Create a shortcut to the `exe` in here. -->
 
-
+### Build it yourself
 
 Install the necessary dependencies
 
@@ -26,10 +43,4 @@ To build run:
 ./build.sh
 ```
 
-#### Preview
-
-![Preview](preview.gif)
-
-Todo:
-
-- Create  a setup file that add adds the program to startup
+That's it.
