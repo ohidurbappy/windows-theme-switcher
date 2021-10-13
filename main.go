@@ -42,14 +42,6 @@ func onReady() {
 		SetAutoRun(true)
 	}
 
-	if isDark() {
-		// systray.SetIcon(getIcon("assets/light_mode.ico"))
-		systray.SetIcon(light_mode)
-	} else {
-		// systray.SetIcon(getIcon("assets/dark_mode.ico"))
-		systray.SetIcon(dark_mode)
-	}
-
 	systray.SetTitle("Theme Switch")
 	systray.SetTooltip("Theme switcher")
 
@@ -57,14 +49,28 @@ func onReady() {
 	mDarkMode := systray.AddMenuItem("Dark Mode", "Switch to Dark Mode")
 	mExit := systray.AddMenuItem("Exit", "Quit the program")
 
+	if isDark() {
+		// systray.SetIcon(getIcon("assets/light_mode.ico"))
+		systray.SetIcon(light_mode)
+		mDarkMode.Disable()
+	} else {
+		// systray.SetIcon(getIcon("assets/dark_mode.ico"))
+		systray.SetIcon(dark_mode)
+		mLightMode.Disable()
+	}
+
 	go func() {
 		for {
 			select {
 			case <-mLightMode.ClickedCh:
 				fmt.Println("Set light mode")
+				mDarkMode.Enable()
+				mLightMode.Disable()
 				setLightModeTheme()
 			case <-mDarkMode.ClickedCh:
 				fmt.Println("Set dark mode")
+				mLightMode.Enable()
+				mDarkMode.Disable()
 				setDarkModeTheme()
 			case <-mExit.ClickedCh:
 				systray.Quit()
