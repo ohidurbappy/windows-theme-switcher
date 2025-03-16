@@ -3,15 +3,16 @@ package main
 import (
 	_ "embed"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/getlantern/systray"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -21,6 +22,10 @@ const (
 	REGNAME_TASKBAR_TRAY     = `SystemUsesLightTheme`
 	REGNAME_APP_LIGHT_THEME  = `AppsUseLightTheme`
 	APPNAME                  = `Windows Theme Switcher`
+
+	// Windows message constants
+	WM_SETTINGCHANGE = 0x001A
+	HWND_BROADCAST   = uintptr(0xFFFF)
 )
 
 //go:embed assets/dark_mode.ico
@@ -28,6 +33,13 @@ var dark_mode []byte
 
 //go:embed assets/light_mode.ico
 var light_mode []byte
+
+// Windows API functions
+var (
+	user32                        = windows.NewLazySystemDLL("user32.dll")
+	sendMessageW                  = user32.NewProc("SendMessageW")
+	UpdatePerUserSystemParameters = syscall.NewLazyDLL("user32.dll").NewProc("UpdatePerUserSystemParameters")
+)
 
 func main() {
 	fmt.Println("Dark Mode on:", isDark())
@@ -87,7 +99,7 @@ func onExit() {
 }
 
 func getIcon(s string) []byte {
-	b, err := ioutil.ReadFile(s)
+	b, err := os.ReadFile(s)
 	if err != nil {
 		fmt.Print(err)
 	}
@@ -98,11 +110,19 @@ func getIcon(s string) []byte {
 func react(isDark bool) {
 	if isDark {
 		systray.SetIcon(light_mode)
-
+		// Refresh menu items if they exist
+		updateMenuItems(isDark)
 	} else {
 		systray.SetIcon(dark_mode)
-
+		// Refresh menu items if they exist
+		updateMenuItems(isDark)
 	}
+}
+
+// Helper function to update menu items based on current theme
+func updateMenuItems(isDark bool) {
+	// This would need to be implemented with access to menu items
+	// For now this is a placeholder for the concept
 }
 
 func isDark() bool {
@@ -131,6 +151,8 @@ func setTheme(themeMode uint32) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Set both registry values
 	if err := k.SetDWordValue(REGNAME_TASKBAR_TRAY, themeMode); err != nil {
 		log.Fatal(err)
 	}
@@ -143,6 +165,25 @@ func setTheme(themeMode uint32) {
 		log.Fatal(err)
 	}
 
+	// Broadcast the theme change to all windows
+	notifyThemeChange()
+}
+
+// Function to notify the system about theme change
+func notifyThemeChange() {
+	// Convert wide string to UTF16 pointer
+	winStr, _ := syscall.UTF16PtrFromString("ImmersiveColorSet")
+
+	// Broadcast theme change message
+	sendMessageW.Call(
+		HWND_BROADCAST,
+		WM_SETTINGCHANGE,
+		0,
+		uintptr(unsafe.Pointer(winStr)),
+	)
+
+	// Update system parameters
+	UpdatePerUserSystemParameters.Call(1, 0)
 }
 
 func monitor(fn func(bool)) {
@@ -236,12 +277,6 @@ func isSetAutoRun() bool {
 	}
 	defer k.Close()
 	_, _, err = k.GetStringValue(APPNAME)
-
-	if err == registry.ErrNotExist {
-		// the key value doesn't exit
-		return false
-	}
-
-	return true
+	return err != registry.ErrNotExist
 
 }
