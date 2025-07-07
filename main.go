@@ -55,40 +55,24 @@ func onReady() {
 	}
 
 	systray.SetTitle("Theme Switch")
-	systray.SetTooltip("Theme switcher")
+	systray.SetTooltip("Theme switcher - Click to toggle theme")
 
-	mLightMode := systray.AddMenuItem("Light Mode", "Switch to Light Mode")
-	mDarkMode := systray.AddMenuItem("Dark Mode", "Switch to Dark Mode")
+	mToggleTheme := systray.AddMenuItem("Toggle Theme", "Switch between Light and Dark themes")
 	mExit := systray.AddMenuItem("Exit", "Quit the program")
 
-	if isDark() {
-		// systray.SetIcon(getIcon("assets/light_mode.ico"))
-		systray.SetIcon(light_mode)
-		mDarkMode.Disable()
-	} else {
-		// systray.SetIcon(getIcon("assets/dark_mode.ico"))
-		systray.SetIcon(dark_mode)
-		mLightMode.Disable()
-	}
+	// Set icon to indicate what clicking will do (opposite of current theme)
+	updateIconAndTooltip()
 
 	go func() {
 		for {
 			select {
-			case <-mLightMode.ClickedCh:
-				fmt.Println("Set light mode")
-				mDarkMode.Enable()
-				mLightMode.Disable()
-				setLightModeTheme()
-			case <-mDarkMode.ClickedCh:
-				fmt.Println("Set dark mode")
-				mLightMode.Enable()
-				mDarkMode.Disable()
-				setDarkModeTheme()
+			case <-mToggleTheme.ClickedCh:
+				toggleTheme()
+				updateIconAndTooltip()
 			case <-mExit.ClickedCh:
 				systray.Quit()
 				return
 			}
-
 		}
 	}()
 
@@ -108,21 +92,7 @@ func getIcon(s string) []byte {
 
 // react to the change
 func react(isDark bool) {
-	if isDark {
-		systray.SetIcon(light_mode)
-		// Refresh menu items if they exist
-		updateMenuItems(isDark)
-	} else {
-		systray.SetIcon(dark_mode)
-		// Refresh menu items if they exist
-		updateMenuItems(isDark)
-	}
-}
-
-// Helper function to update menu items based on current theme
-func updateMenuItems(isDark bool) {
-	// This would need to be implemented with access to menu items
-	// For now this is a placeholder for the concept
+	updateIconAndTooltip()
 }
 
 func isDark() bool {
@@ -144,6 +114,30 @@ func setDarkModeTheme() {
 
 func setLightModeTheme() {
 	setTheme(1)
+}
+
+// toggleTheme switches between light and dark themes based on current state
+func toggleTheme() {
+	if isDark() {
+		fmt.Println("Switching to light mode")
+		setLightModeTheme()
+	} else {
+		fmt.Println("Switching to dark mode")
+		setDarkModeTheme()
+	}
+}
+
+// updateIconAndTooltip updates the systray icon and tooltip to reflect current state
+func updateIconAndTooltip() {
+	if isDark() {
+		// Currently dark, so icon shows light (what clicking will do)
+		systray.SetIcon(light_mode)
+		systray.SetTooltip("Theme switcher - Click to switch to Light mode")
+	} else {
+		// Currently light, so icon shows dark (what clicking will do)
+		systray.SetIcon(dark_mode)
+		systray.SetTooltip("Theme switcher - Click to switch to Dark mode")
+	}
 }
 
 func setTheme(themeMode uint32) {
