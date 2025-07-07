@@ -138,7 +138,7 @@ func initializeSystemTray() {
 	
 	// Create hidden window
 	windowName, _ := syscall.UTF16PtrFromString("Theme Switcher")
-	hwnd, _, _ = createWindowEx.Call(
+	ret, _, _ := createWindowEx.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
@@ -148,6 +148,7 @@ func initializeSystemTray() {
 		hInstance,
 		0,
 	)
+	hwnd = syscall.Handle(ret)
 	
 	// Load icons from embedded data
 	lightIcon = createIconFromData(light_mode)
