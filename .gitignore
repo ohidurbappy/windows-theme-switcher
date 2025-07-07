@@ -1,3 +1,11 @@
 *.exe
 *.syso
 *.rar
+
+# Binary executables (without extension)
+windows-theme-switcher
+**/windows-theme-switcher
+
+# Build output directories
+dist/
+build/
