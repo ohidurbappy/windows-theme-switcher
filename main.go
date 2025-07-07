@@ -65,6 +65,7 @@ var (
 	postQuitMessage               = user32.NewProc("PostQuitMessage")
 	loadIcon                      = user32.NewProc("LoadIconW")
 	loadImage                     = user32.NewProc("LoadImageW")
+	createIconFromResourceEx      = user32.NewProc("CreateIconFromResourceEx")
 	getModuleHandle               = kernel32.NewProc("GetModuleHandleW")
 )
 
@@ -162,28 +163,60 @@ func initializeSystemTray() {
 }
 
 func createIconFromData(data []byte) syscall.Handle {
-	// Create icon from embedded ICO data
-	// For now, we'll use different system icons to represent light/dark modes
-	// This should be enhanced to properly load the embedded .ico files
+	// ICO files start with an ICONDIR structure, but for CreateIconFromResourceEx
+	// we need to skip the ICO header and pass just the icon image data
+	// ICO format: ICONDIR (6 bytes) + ICONDIRENTRY array + actual icon data
 	
-	if len(data) > 0 {
-		// In a full implementation, we'd parse the ICO format and use:
-		// CreateIconFromResource or CreateIconFromResourceEx
-		
-		// For demo purposes, use different system icons:
-		if len(data) == len(light_mode) {
-			// Light mode icon - use sun-like icon
-			icon, _, _ := loadIcon.Call(0, 32516) // IDI_WARNING (triangle, yellowish)
-			return syscall.Handle(icon)
-		} else {
-			// Dark mode icon - use moon-like icon  
-			icon, _, _ := loadIcon.Call(0, 32513) // IDI_QUESTION (blue)
-			return syscall.Handle(icon)
-		}
+	if len(data) < 6 {
+		// Fallback to system icon if data is invalid
+		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
+		return syscall.Handle(icon)
 	}
 	
-	icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION (default)
-	return syscall.Handle(icon)
+	// Parse ICO header to find the first icon entry
+	// ICONDIR: Reserved(2) + Type(2) + Count(2)
+	iconCount := uint16(data[4]) | (uint16(data[5]) << 8)
+	if iconCount == 0 || len(data) < 6 + int(iconCount)*16 {
+		// Fallback to system icon if structure is invalid
+		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION  
+		return syscall.Handle(icon)
+	}
+	
+	// Get first ICONDIRENTRY (16 bytes starting at offset 6)
+	entryOffset := 6
+	imageOffset := uint32(data[entryOffset+12]) | (uint32(data[entryOffset+13]) << 8) | 
+	              (uint32(data[entryOffset+14]) << 16) | (uint32(data[entryOffset+15]) << 24)
+	imageSize := uint32(data[entryOffset+8]) | (uint32(data[entryOffset+9]) << 8) | 
+	            (uint32(data[entryOffset+10]) << 16) | (uint32(data[entryOffset+11]) << 24)
+	
+	// Validate image offset and size
+	if imageOffset >= uint32(len(data)) || imageOffset+imageSize > uint32(len(data)) {
+		// Fallback to system icon if offset/size is invalid
+		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
+		return syscall.Handle(icon)
+	}
+	
+	// Extract the actual icon image data (skip ICO header)
+	imageData := data[imageOffset:imageOffset+imageSize]
+	
+	// Create icon from the image data
+	icon, _, _ := createIconFromResourceEx.Call(
+		uintptr(unsafe.Pointer(&imageData[0])), // pointer to icon data
+		uintptr(imageSize),                      // size of icon data  
+		1,                                       // fIcon = TRUE (this is an icon, not cursor)
+		0x00030000,                             // dwVersion = 0x00030000
+		0,                                       // cxDesired = 0 (use default)
+		0,                                       // cyDesired = 0 (use default)  
+		0,                                       // Flags = 0 (default behavior)
+	)
+	
+	if icon != 0 {
+		return syscall.Handle(icon)
+	}
+	
+	// Final fallback to system icon if CreateIconFromResourceEx failed
+	fallbackIcon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
+	return syscall.Handle(fallbackIcon)
 }
 
 func createTrayIcon() {
