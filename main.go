@@ -40,6 +40,16 @@ const (
 	WM_TRAYICON    = WM_USER + 1
 	WM_LBUTTONUP   = 0x0202
 	WM_RBUTTONUP   = 0x0205
+	WM_COMMAND     = 0x0111
+
+	// Menu constants
+	TPM_BOTTOMALIGN = 0x0020
+	TPM_LEFTALIGN   = 0x0000
+	TPM_RIGHTBUTTON = 0x0002
+	MF_STRING       = 0x0000
+	
+	// Menu item IDs
+	ID_EXIT = 1001
 )
 
 //go:embed assets/dark_mode.ico
@@ -67,6 +77,12 @@ var (
 	loadImage                     = user32.NewProc("LoadImageW")
 	createIconFromResourceEx      = user32.NewProc("CreateIconFromResourceEx")
 	getModuleHandle               = kernel32.NewProc("GetModuleHandleW")
+	createPopupMenu               = user32.NewProc("CreatePopupMenu")
+	appendMenuW                   = user32.NewProc("AppendMenuW")
+	trackPopupMenu                = user32.NewProc("TrackPopupMenu")
+	getCursorPos                  = user32.NewProc("GetCursorPos")
+	destroyMenu                   = user32.NewProc("DestroyMenu")
+	setForegroundWindow           = user32.NewProc("SetForegroundWindow")
 )
 
 // NOTIFYICONDATA structure for Shell_NotifyIcon
@@ -102,6 +118,12 @@ type MSG struct {
 	LParam  uintptr
 	Time    uint32
 	Pt      struct{ X, Y int32 }
+}
+
+// POINT structure
+type POINT struct {
+	X int32
+	Y int32
 }
 
 var (
@@ -268,6 +290,37 @@ func getCurrentTooltip() string {
 	}
 }
 
+func showContextMenu() {
+	// Create popup menu
+	hMenu, _, _ := createPopupMenu.Call()
+	if hMenu == 0 {
+		return
+	}
+	defer destroyMenu.Call(hMenu)
+
+	// Add "Exit" menu item
+	exitText, _ := syscall.UTF16PtrFromString("Exit")
+	appendMenuW.Call(hMenu, MF_STRING, ID_EXIT, uintptr(unsafe.Pointer(exitText)))
+
+	// Get cursor position
+	var pt POINT
+	getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+
+	// Set foreground window to ensure menu appears properly
+	setForegroundWindow.Call(uintptr(hwnd))
+
+	// Show context menu
+	trackPopupMenu.Call(
+		hMenu,
+		TPM_BOTTOMALIGN|TPM_LEFTALIGN|TPM_RIGHTBUTTON,
+		uintptr(pt.X),
+		uintptr(pt.Y),
+		0,
+		uintptr(hwnd),
+		0,
+	)
+}
+
 func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_TRAYICON:
@@ -277,8 +330,18 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 			toggleTheme()
 			updateTrayIcon()
 		} else if lParam == WM_RBUTTONUP {
-			// Right click could show a minimal context menu for "Exit" if needed
-			// For now, we'll ignore right clicks to keep it truly 1-click
+			// Right click - show context menu with Exit option
+			fmt.Println("Tray icon right-clicked - showing context menu")
+			showContextMenu()
+		}
+		return 0
+	case WM_COMMAND:
+		// Handle menu item selection
+		menuID := wParam & 0xFFFF
+		switch menuID {
+		case ID_EXIT:
+			fmt.Println("Exit selected from context menu")
+			onExit()
 		}
 		return 0
 	default:
