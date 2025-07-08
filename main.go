@@ -30,16 +30,26 @@ const (
 	HWND_BROADCAST   = uintptr(0xFFFF)
 
 	// System tray constants
-	NIM_ADD        = 0x00000000
-	NIM_MODIFY     = 0x00000001
-	NIM_DELETE     = 0x00000002
-	NIF_MESSAGE    = 0x00000001
-	NIF_ICON       = 0x00000002
-	NIF_TIP        = 0x00000004
-	WM_USER        = 0x0400
-	WM_TRAYICON    = WM_USER + 1
-	WM_LBUTTONUP   = 0x0202
-	WM_RBUTTONUP   = 0x0205
+	NIM_ADD      = 0x00000000
+	NIM_MODIFY   = 0x00000001
+	NIM_DELETE   = 0x00000002
+	NIF_MESSAGE  = 0x00000001
+	NIF_ICON     = 0x00000002
+	NIF_TIP      = 0x00000004
+	WM_USER      = 0x0400
+	WM_TRAYICON  = WM_USER + 1
+	WM_LBUTTONUP = 0x0202
+	WM_RBUTTONUP = 0x0205
+	WM_COMMAND   = 0x0111
+
+	// Menu constants
+	TPM_BOTTOMALIGN = 0x0020
+	TPM_LEFTALIGN   = 0x0000
+	TPM_RIGHTBUTTON = 0x0002
+	MF_STRING       = 0x0000
+
+	// Menu item IDs
+	ID_EXIT = 1001
 )
 
 //go:embed assets/dark_mode.ico
@@ -67,6 +77,12 @@ var (
 	loadImage                     = user32.NewProc("LoadImageW")
 	createIconFromResourceEx      = user32.NewProc("CreateIconFromResourceEx")
 	getModuleHandle               = kernel32.NewProc("GetModuleHandleW")
+	createPopupMenu               = user32.NewProc("CreatePopupMenu")
+	appendMenuW                   = user32.NewProc("AppendMenuW")
+	trackPopupMenu                = user32.NewProc("TrackPopupMenu")
+	getCursorPos                  = user32.NewProc("GetCursorPos")
+	destroyMenu                   = user32.NewProc("DestroyMenu")
+	setForegroundWindow           = user32.NewProc("SetForegroundWindow")
 )
 
 // NOTIFYICONDATA structure for Shell_NotifyIcon
@@ -104,21 +120,27 @@ type MSG struct {
 	Pt      struct{ X, Y int32 }
 }
 
+// POINT structure
+type POINT struct {
+	X int32
+	Y int32
+}
+
 var (
-	hwnd        syscall.Handle
-	lightIcon   syscall.Handle
-	darkIcon    syscall.Handle
+	hwnd      syscall.Handle
+	lightIcon syscall.Handle
+	darkIcon  syscall.Handle
 )
 
 func main() {
 	fmt.Println("Dark Mode on:", isDark())
-	
+
 	if !isSetAutoRun() {
 		SetAutoRun(true)
 	}
-	
+
 	go monitor(react)
-	
+
 	// Initialize Windows GUI
 	initializeSystemTray()
 }
@@ -126,7 +148,7 @@ func main() {
 func initializeSystemTray() {
 	// Get module handle
 	hInstance, _, _ := getModuleHandle.Call(0)
-	
+
 	// Register window class
 	className, _ := syscall.UTF16PtrFromString("ThemeSwitcherClass")
 	wc := WNDCLASS{
@@ -134,9 +156,9 @@ func initializeSystemTray() {
 		HInstance:     syscall.Handle(hInstance),
 		LpszClassName: className,
 	}
-	
+
 	registerClass.Call(uintptr(unsafe.Pointer(&wc)))
-	
+
 	// Create hidden window
 	windowName, _ := syscall.UTF16PtrFromString("Theme Switcher")
 	ret, _, _ := createWindowEx.Call(
@@ -150,14 +172,14 @@ func initializeSystemTray() {
 		0,
 	)
 	hwnd = syscall.Handle(ret)
-	
+
 	// Load icons from embedded data
 	lightIcon = createIconFromData(light_mode)
 	darkIcon = createIconFromData(dark_mode)
-	
+
 	// Create system tray icon
 	createTrayIcon()
-	
+
 	// Message loop
 	messageLoop()
 }
@@ -166,54 +188,54 @@ func createIconFromData(data []byte) syscall.Handle {
 	// ICO files start with an ICONDIR structure, but for CreateIconFromResourceEx
 	// we need to skip the ICO header and pass just the icon image data
 	// ICO format: ICONDIR (6 bytes) + ICONDIRENTRY array + actual icon data
-	
+
 	if len(data) < 6 {
 		// Fallback to system icon if data is invalid
 		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
 		return syscall.Handle(icon)
 	}
-	
+
 	// Parse ICO header to find the first icon entry
 	// ICONDIR: Reserved(2) + Type(2) + Count(2)
 	iconCount := uint16(data[4]) | (uint16(data[5]) << 8)
-	if iconCount == 0 || len(data) < 6 + int(iconCount)*16 {
+	if iconCount == 0 || len(data) < 6+int(iconCount)*16 {
 		// Fallback to system icon if structure is invalid
-		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION  
+		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
 		return syscall.Handle(icon)
 	}
-	
+
 	// Get first ICONDIRENTRY (16 bytes starting at offset 6)
 	entryOffset := 6
-	imageOffset := uint32(data[entryOffset+12]) | (uint32(data[entryOffset+13]) << 8) | 
-	              (uint32(data[entryOffset+14]) << 16) | (uint32(data[entryOffset+15]) << 24)
-	imageSize := uint32(data[entryOffset+8]) | (uint32(data[entryOffset+9]) << 8) | 
-	            (uint32(data[entryOffset+10]) << 16) | (uint32(data[entryOffset+11]) << 24)
-	
+	imageOffset := uint32(data[entryOffset+12]) | (uint32(data[entryOffset+13]) << 8) |
+		(uint32(data[entryOffset+14]) << 16) | (uint32(data[entryOffset+15]) << 24)
+	imageSize := uint32(data[entryOffset+8]) | (uint32(data[entryOffset+9]) << 8) |
+		(uint32(data[entryOffset+10]) << 16) | (uint32(data[entryOffset+11]) << 24)
+
 	// Validate image offset and size
 	if imageOffset >= uint32(len(data)) || imageOffset+imageSize > uint32(len(data)) {
 		// Fallback to system icon if offset/size is invalid
 		icon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
 		return syscall.Handle(icon)
 	}
-	
+
 	// Extract the actual icon image data (skip ICO header)
-	imageData := data[imageOffset:imageOffset+imageSize]
-	
+	imageData := data[imageOffset : imageOffset+imageSize]
+
 	// Create icon from the image data
 	icon, _, _ := createIconFromResourceEx.Call(
 		uintptr(unsafe.Pointer(&imageData[0])), // pointer to icon data
-		uintptr(imageSize),                      // size of icon data  
-		1,                                       // fIcon = TRUE (this is an icon, not cursor)
+		uintptr(imageSize),                     // size of icon data
+		1,                                      // fIcon = TRUE (this is an icon, not cursor)
 		0x00030000,                             // dwVersion = 0x00030000
-		0,                                       // cxDesired = 0 (use default)
-		0,                                       // cyDesired = 0 (use default)  
-		0,                                       // Flags = 0 (default behavior)
+		0,                                      // cxDesired = 0 (use default)
+		0,                                      // cyDesired = 0 (use default)
+		0,                                      // Flags = 0 (default behavior)
 	)
-	
+
 	if icon != 0 {
 		return syscall.Handle(icon)
 	}
-	
+
 	// Final fallback to system icon if CreateIconFromResourceEx failed
 	fallbackIcon, _, _ := loadIcon.Call(0, 32512) // IDI_APPLICATION
 	return syscall.Handle(fallbackIcon)
@@ -228,27 +250,27 @@ func createTrayIcon() {
 		UCallbackMessage: WM_TRAYICON,
 		HIcon:            getCurrentIcon(),
 	}
-	
+
 	// Set tooltip
 	tip := getCurrentTooltip()
 	copy(nid.SzTip[:], syscall.StringToUTF16(tip))
-	
+
 	shellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&nid)))
 }
 
 func updateTrayIcon() {
 	nid := NOTIFYICONDATA{
-		CbSize:           uint32(unsafe.Sizeof(NOTIFYICONDATA{})),
-		Hwnd:             hwnd,
-		UID:              1,
-		UFlags:           NIF_ICON | NIF_TIP,
-		HIcon:            getCurrentIcon(),
+		CbSize: uint32(unsafe.Sizeof(NOTIFYICONDATA{})),
+		Hwnd:   hwnd,
+		UID:    1,
+		UFlags: NIF_ICON | NIF_TIP,
+		HIcon:  getCurrentIcon(),
 	}
-	
+
 	// Set tooltip
 	tip := getCurrentTooltip()
 	copy(nid.SzTip[:], syscall.StringToUTF16(tip))
-	
+
 	shellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
 }
 
@@ -268,6 +290,37 @@ func getCurrentTooltip() string {
 	}
 }
 
+func showContextMenu() {
+	// Create popup menu
+	hMenu, _, _ := createPopupMenu.Call()
+	if hMenu == 0 {
+		return
+	}
+	defer destroyMenu.Call(hMenu)
+
+	// Add "Exit" menu item
+	exitText, _ := syscall.UTF16PtrFromString("Exit")
+	appendMenuW.Call(hMenu, MF_STRING, ID_EXIT, uintptr(unsafe.Pointer(exitText)))
+
+	// Get cursor position
+	var pt POINT
+	getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+
+	// Set foreground window to ensure menu appears properly
+	setForegroundWindow.Call(uintptr(hwnd))
+
+	// Show context menu
+	trackPopupMenu.Call(
+		hMenu,
+		TPM_BOTTOMALIGN|TPM_LEFTALIGN|TPM_RIGHTBUTTON,
+		uintptr(pt.X),
+		uintptr(pt.Y),
+		0,
+		uintptr(hwnd),
+		0,
+	)
+}
+
 func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_TRAYICON:
@@ -277,8 +330,18 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 			toggleTheme()
 			updateTrayIcon()
 		} else if lParam == WM_RBUTTONUP {
-			// Right click could show a minimal context menu for "Exit" if needed
-			// For now, we'll ignore right clicks to keep it truly 1-click
+			// Right click - show context menu with Exit option
+			fmt.Println("Tray icon right-clicked - showing context menu")
+			showContextMenu()
+		}
+		return 0
+	case WM_COMMAND:
+		// Handle menu item selection
+		menuID := wParam & 0xFFFF
+		switch menuID {
+		case ID_EXIT:
+			fmt.Println("Exit selected from context menu")
+			onExit()
 		}
 		return 0
 	default:
@@ -296,7 +359,7 @@ func messageLoop() {
 		} else if ret == 0xFFFFFFFF { // Error
 			break
 		}
-		
+
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
@@ -314,7 +377,7 @@ func onExit() {
 		UID:    1,
 	}
 	shellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
-	
+
 	postQuitMessage.Call(0)
 }
 
