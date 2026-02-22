@@ -5,6 +5,7 @@ package main
 
 import (
 	_ "embed"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -133,10 +134,21 @@ var (
 )
 
 func main() {
+	lightTime := flag.String("light-time", "", "time to switch to light mode (HH:MM, e.g. 06:00)")
+	darkTime := flag.String("dark-time", "", "time to switch to dark mode (HH:MM, e.g. 20:00)")
+	flag.Parse()
+
 	fmt.Println("Dark Mode on:", isDark())
 
 	if !isSetAutoRun() {
 		SetAutoRun(true)
+	}
+
+	if *lightTime != "" || *darkTime != "" {
+		if *lightTime == "" || *darkTime == "" {
+			log.Fatal("Both -light-time and -dark-time must be specified together")
+		}
+		startScheduler(*lightTime, *darkTime)
 	}
 
 	go monitor(react)
@@ -505,6 +517,80 @@ func monitor(fn func(bool)) {
 }
 
 // auto dark mode light mode switch
+
+// parseTime parses a time string in HH:MM format and returns the hour and minute.
+func parseTime(s string) (int, int, error) {
+	var h, m int
+	n, err := fmt.Sscanf(s, "%d:%d", &h, &m)
+	if err != nil || n != 2 || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid time %q, expected HH:MM (e.g. 06:00)", s)
+	}
+	return h, m, nil
+}
+
+// shouldBeLightModeAt returns true if, given the light and dark switch times,
+// the provided time falls within the light mode window.
+func shouldBeLightModeAt(lightTime, darkTime string, now time.Time) (bool, error) {
+	lh, lm, err := parseTime(lightTime)
+	if err != nil {
+		return false, err
+	}
+	dh, dm, err := parseTime(darkTime)
+	if err != nil {
+		return false, err
+	}
+	if lh*60+lm == dh*60+dm {
+		return false, fmt.Errorf("light-time and dark-time must be different")
+	}
+	current := now.Hour()*60 + now.Minute()
+	light := lh*60 + lm
+	dark := dh*60 + dm
+	if light < dark {
+		// e.g. light=06:00, dark=20:00 → light mode between 06:00 and 20:00
+		return current >= light && current < dark, nil
+	}
+	// e.g. light=06:00, dark=02:00 → dark only between 02:00 and 06:00
+	return current >= light || current < dark, nil
+}
+
+// shouldBeLightMode returns true if the current time falls within the light mode window.
+func shouldBeLightMode(lightTime, darkTime string) (bool, error) {
+	return shouldBeLightModeAt(lightTime, darkTime, time.Now())
+}
+
+// startScheduler sets the initial theme based on the provided times and starts
+// a background goroutine that switches the theme at the scheduled times.
+func startScheduler(lightTime, darkTime string) {
+	isLight, err := shouldBeLightMode(lightTime, darkTime)
+	if err != nil {
+		log.Printf("Scheduler error: %v", err)
+		return
+	}
+	fmt.Printf("Scheduler active (light-time=%s, dark-time=%s): setting initial theme (light=%v)\n", lightTime, darkTime, isLight)
+	if isLight {
+		setLightModeTheme()
+	} else {
+		setDarkModeTheme()
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			isLight, err := shouldBeLightMode(lightTime, darkTime)
+			if err != nil {
+				log.Printf("Scheduler error: %v", err)
+				continue
+			}
+			if isLight && isDark() {
+				fmt.Println("Scheduler: switching to light mode")
+				setLightModeTheme()
+			} else if !isLight && !isDark() {
+				fmt.Println("Scheduler: switching to dark mode")
+				setDarkModeTheme()
+			}
+		}
+	}()
+}
 
 func getClockTime(tz string) string {
 	t := time.Now()
