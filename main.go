@@ -5,11 +5,13 @@ package main
 
 import (
 	_ "embed"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -49,7 +51,30 @@ const (
 	MF_STRING       = 0x0000
 
 	// Menu item IDs
-	ID_EXIT = 1001
+	ID_EXIT           = 1001
+	ID_SET_LIGHT_TIME = 1002
+	ID_SET_DARK_TIME  = 1003
+	ID_CLEAR_SCHEDULE = 1004
+
+	// Input dialog control IDs (1=IDOK, 2=IDCANCEL for IsDialogMessage compatibility)
+	ID_DIALOG_OK     = 1
+	ID_DIALOG_CANCEL = 2
+
+	// Additional menu flags
+	MF_SEPARATOR = 0x0800
+
+	// Additional Windows messages
+	WM_CLOSE = 0x0010
+
+	// ShowWindow command
+	SW_SHOW = 5
+
+	// Window extended styles
+	WS_EX_CLIENTEDGE = 0x00000200
+	WS_EX_TOPMOST    = 0x00000008
+
+	// Schedule registry key (HKCU)
+	REGKEY_SCHEDULE = `Software\WindowsThemeSwitcher`
 )
 
 //go:embed assets/dark_mode.ico
@@ -83,6 +108,12 @@ var (
 	getCursorPos                  = user32.NewProc("GetCursorPos")
 	destroyMenu                   = user32.NewProc("DestroyMenu")
 	setForegroundWindow           = user32.NewProc("SetForegroundWindow")
+	showWindow                    = user32.NewProc("ShowWindow")
+	getWindowTextW                = user32.NewProc("GetWindowTextW")
+	destroyWindow                 = user32.NewProc("DestroyWindow")
+	setFocus                      = user32.NewProc("SetFocus")
+	isDialogMessage               = user32.NewProc("IsDialogMessage")
+	getSystemMetrics              = user32.NewProc("GetSystemMetrics")
 )
 
 // NOTIFYICONDATA structure for Shell_NotifyIcon
@@ -130,15 +161,52 @@ var (
 	hwnd      syscall.Handle
 	lightIcon syscall.Handle
 	darkIcon  syscall.Handle
+
+	// Schedule state – guarded by schedMu.
+	schedMu        sync.Mutex
+	schedLightTime string
+	schedDarkTime  string
+
+	// Input dialog state – accessed only on the main GUI thread.
+	inputEditHwnd syscall.Handle
+	inputResult   string
+	inputOK       bool
+	inputDone     bool
+
+	// inputDialogWndProc is the Windows callback for the input dialog window.
+	// It must be created once at package level (syscall.NewCallback limit).
+	inputDialogWndProc = syscall.NewCallback(inputDialogProc)
 )
 
 func main() {
+	lightTimeFlag := flag.String("light-time", "", "time to switch to light mode (HH:MM, e.g. 06:00)")
+	darkTimeFlag := flag.String("dark-time", "", "time to switch to dark mode (HH:MM, e.g. 20:00)")
+	flag.Parse()
+
 	fmt.Println("Dark Mode on:", isDark())
 
 	if !isSetAutoRun() {
 		SetAutoRun(true)
 	}
 
+	if *lightTimeFlag != "" || *darkTimeFlag != "" {
+		if *lightTimeFlag == "" || *darkTimeFlag == "" {
+			log.Fatal("Both -light-time and -dark-time must be specified together")
+		}
+		if err := setSchedule(*lightTimeFlag, *darkTimeFlag); err != nil {
+			log.Fatalf("Invalid schedule: %v", err)
+		}
+		saveScheduleToRegistry(*lightTimeFlag, *darkTimeFlag)
+	} else {
+		// No flags – restore persisted schedule from registry.
+		if lt, dt := loadScheduleFromRegistry(); lt != "" && dt != "" {
+			if err := setSchedule(lt, dt); err != nil {
+				log.Printf("Ignoring invalid persisted schedule: %v", err)
+			}
+		}
+	}
+
+	go runScheduler()
 	go monitor(react)
 
 	// Initialize Windows GUI
@@ -298,6 +366,34 @@ func showContextMenu() {
 	}
 	defer destroyMenu.Call(hMenu)
 
+	// Build schedule-aware labels.
+	schedMu.Lock()
+	lt, dt := schedLightTime, schedDarkTime
+	schedMu.Unlock()
+
+	lightLabel := "Set Light Time..."
+	if lt != "" {
+		lightLabel = "Set Light Time... (" + lt + ")"
+	}
+	darkLabel := "Set Dark Time..."
+	if dt != "" {
+		darkLabel = "Set Dark Time... (" + dt + ")"
+	}
+
+	lightText, _ := syscall.UTF16PtrFromString(lightLabel)
+	appendMenuW.Call(hMenu, MF_STRING, ID_SET_LIGHT_TIME, uintptr(unsafe.Pointer(lightText)))
+
+	darkText, _ := syscall.UTF16PtrFromString(darkLabel)
+	appendMenuW.Call(hMenu, MF_STRING, ID_SET_DARK_TIME, uintptr(unsafe.Pointer(darkText)))
+
+	if lt != "" || dt != "" {
+		clearText, _ := syscall.UTF16PtrFromString("Clear Schedule")
+		appendMenuW.Call(hMenu, MF_STRING, ID_CLEAR_SCHEDULE, uintptr(unsafe.Pointer(clearText)))
+	}
+
+	// Separator before Exit
+	appendMenuW.Call(hMenu, MF_SEPARATOR, 0, 0)
+
 	// Add "Exit" menu item
 	exitText, _ := syscall.UTF16PtrFromString("Exit")
 	appendMenuW.Call(hMenu, MF_STRING, ID_EXIT, uintptr(unsafe.Pointer(exitText)))
@@ -330,7 +426,7 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 			toggleTheme()
 			updateTrayIcon()
 		} else if lParam == WM_RBUTTONUP {
-			// Right click - show context menu with Exit option
+			// Right click - show context menu with schedule and Exit options
 			fmt.Println("Tray icon right-clicked - showing context menu")
 			showContextMenu()
 		}
@@ -342,6 +438,72 @@ func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr
 		case ID_EXIT:
 			fmt.Println("Exit selected from context menu")
 			onExit()
+		case ID_SET_LIGHT_TIME:
+			schedMu.Lock()
+			currentLight := schedLightTime
+			schedMu.Unlock()
+			result, ok := showInputDialog(
+				"Set Light Mode Time",
+				"Enter time to switch to light mode (HH:MM):",
+				currentLight,
+			)
+			if !ok {
+				break
+			}
+			if _, _, err := parseTime(result); err != nil {
+				fmt.Printf("Invalid light time %q: %v\n", result, err)
+				break
+			}
+			// Update light time and re-read dark time atomically so we use
+			// the most current value even if the dialog took a while.
+			schedMu.Lock()
+			schedLightTime = result
+			newDark := schedDarkTime
+			schedMu.Unlock()
+			if newDark != "" {
+				if err := setSchedule(result, newDark); err == nil {
+					saveScheduleToRegistry(result, newDark)
+					updateTrayIcon()
+				} else {
+					fmt.Printf("Schedule error: %v\n", err)
+				}
+			} else {
+				fmt.Printf("Light time set to %s. Set dark time to activate schedule.\n", result)
+			}
+		case ID_SET_DARK_TIME:
+			schedMu.Lock()
+			currentDark := schedDarkTime
+			schedMu.Unlock()
+			result, ok := showInputDialog(
+				"Set Dark Mode Time",
+				"Enter time to switch to dark mode (HH:MM):",
+				currentDark,
+			)
+			if !ok {
+				break
+			}
+			if _, _, err := parseTime(result); err != nil {
+				fmt.Printf("Invalid dark time %q: %v\n", result, err)
+				break
+			}
+			// Update dark time and re-read light time atomically.
+			schedMu.Lock()
+			schedDarkTime = result
+			newLight := schedLightTime
+			schedMu.Unlock()
+			if newLight != "" {
+				if err := setSchedule(newLight, result); err == nil {
+					saveScheduleToRegistry(newLight, result)
+					updateTrayIcon()
+				} else {
+					fmt.Printf("Schedule error: %v\n", err)
+				}
+			} else {
+				fmt.Printf("Dark time set to %s. Set light time to activate schedule.\n", result)
+			}
+		case ID_CLEAR_SCHEDULE:
+			clearSchedule()
+			clearScheduleFromRegistry()
 		}
 		return 0
 	default:
@@ -505,6 +667,293 @@ func monitor(fn func(bool)) {
 }
 
 // auto dark mode light mode switch
+
+// parseTime parses a time string in HH:MM format and returns the hour and minute.
+func parseTime(s string) (int, int, error) {
+	var h, m int
+	n, err := fmt.Sscanf(s, "%d:%d", &h, &m)
+	if err != nil || n != 2 || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid time %q, expected HH:MM (e.g. 06:00)", s)
+	}
+	return h, m, nil
+}
+
+// shouldBeLightModeAt returns true if, given the light and dark switch times,
+// the provided time falls within the light mode window.
+func shouldBeLightModeAt(lightTime, darkTime string, now time.Time) (bool, error) {
+	lh, lm, err := parseTime(lightTime)
+	if err != nil {
+		return false, err
+	}
+	dh, dm, err := parseTime(darkTime)
+	if err != nil {
+		return false, err
+	}
+	if lh*60+lm == dh*60+dm {
+		return false, fmt.Errorf("light-time and dark-time must be different")
+	}
+	current := now.Hour()*60 + now.Minute()
+	light := lh*60 + lm
+	dark := dh*60 + dm
+	if light < dark {
+		// e.g. light=06:00, dark=20:00 → light mode between 06:00 and 20:00
+		return current >= light && current < dark, nil
+	}
+	// e.g. light=06:00, dark=02:00 → dark only between 02:00 and 06:00
+	return current >= light || current < dark, nil
+}
+
+// shouldBeLightMode returns true if the current time falls within the light mode window.
+func shouldBeLightMode(lightTime, darkTime string) (bool, error) {
+	return shouldBeLightModeAt(lightTime, darkTime, time.Now())
+}
+
+// setSchedule validates the given times, updates the global schedule state,
+// and immediately applies the correct theme. Returns an error on invalid times.
+func setSchedule(lightTime, darkTime string) error {
+	isLight, err := shouldBeLightMode(lightTime, darkTime)
+	if err != nil {
+		return err
+	}
+	schedMu.Lock()
+	schedLightTime = lightTime
+	schedDarkTime = darkTime
+	schedMu.Unlock()
+	fmt.Printf("Scheduler active: light=%s dark=%s (now light=%v)\n", lightTime, darkTime, isLight)
+	if isLight {
+		setLightModeTheme()
+	} else {
+		setDarkModeTheme()
+	}
+	return nil
+}
+
+// clearSchedule disables the active schedule without changing the current theme.
+func clearSchedule() {
+	schedMu.Lock()
+	schedLightTime = ""
+	schedDarkTime = ""
+	schedMu.Unlock()
+	fmt.Println("Schedule cleared")
+}
+
+// runScheduler is a long-running goroutine that checks the schedule every minute
+// and switches the theme when a boundary time is crossed.
+func runScheduler() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		schedMu.Lock()
+		lt, dt := schedLightTime, schedDarkTime
+		schedMu.Unlock()
+		if lt == "" || dt == "" {
+			continue
+		}
+		isLight, err := shouldBeLightMode(lt, dt)
+		if err != nil {
+			log.Printf("Scheduler error: %v", err)
+			continue
+		}
+		if isLight && isDark() {
+			fmt.Println("Scheduler: switching to light mode")
+			setLightModeTheme()
+		} else if !isLight && !isDark() {
+			fmt.Println("Scheduler: switching to dark mode")
+			setDarkModeTheme()
+		}
+	}
+}
+
+// loadScheduleFromRegistry returns the stored light and dark times from the registry.
+// Returns empty strings when no schedule is stored.
+func loadScheduleFromRegistry() (string, string) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_SCHEDULE, registry.QUERY_VALUE)
+	if err != nil {
+		return "", ""
+	}
+	defer k.Close()
+	lt, _, err := k.GetStringValue("LightTime")
+	if err != nil {
+		return "", ""
+	}
+	dt, _, err := k.GetStringValue("DarkTime")
+	if err != nil {
+		return "", ""
+	}
+	return lt, dt
+}
+
+// saveScheduleToRegistry persists the schedule times so they survive restarts.
+func saveScheduleToRegistry(lightTime, darkTime string) {
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, REGKEY_SCHEDULE, registry.SET_VALUE)
+	if err != nil {
+		log.Printf("Failed to save schedule to registry: %v", err)
+		return
+	}
+	defer k.Close()
+	if err := k.SetStringValue("LightTime", lightTime); err != nil {
+		log.Printf("Failed to write LightTime to registry: %v", err)
+	}
+	if err := k.SetStringValue("DarkTime", darkTime); err != nil {
+		log.Printf("Failed to write DarkTime to registry: %v", err)
+	}
+}
+
+// clearScheduleFromRegistry removes the persisted schedule from the registry.
+func clearScheduleFromRegistry() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, REGKEY_SCHEDULE, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	if err := k.DeleteValue("LightTime"); err != nil && err != registry.ErrNotExist {
+		log.Printf("Failed to delete LightTime from registry: %v", err)
+	}
+	if err := k.DeleteValue("DarkTime"); err != nil && err != registry.ErrNotExist {
+		log.Printf("Failed to delete DarkTime from registry: %v", err)
+	}
+}
+
+// inputDialogProc is the window procedure for the time-entry input dialog.
+// It is referenced via the package-level inputDialogWndProc callback.
+func inputDialogProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case WM_COMMAND:
+		id := wParam & 0xFFFF
+		switch id {
+		case ID_DIALOG_OK:
+			buf := make([]uint16, 32)
+			getWindowTextW.Call(uintptr(inputEditHwnd), uintptr(unsafe.Pointer(&buf[0])), 32)
+			inputResult = syscall.UTF16ToString(buf)
+			inputOK = true
+			inputDone = true
+			destroyWindow.Call(uintptr(hwnd))
+		case ID_DIALOG_CANCEL:
+			inputOK = false
+			inputDone = true
+			destroyWindow.Call(uintptr(hwnd))
+		}
+		return 0
+	case WM_CLOSE:
+		inputOK = false
+		inputDone = true
+		destroyWindow.Call(uintptr(hwnd))
+		return 0
+	}
+	ret, _, _ := defWindowProc.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+	return ret
+}
+
+// showInputDialog displays a minimal popup dialog with a text entry field.
+// It returns the entered text and true on OK, or (defaultValue, false) on Cancel.
+// Must be called from the main GUI thread.
+func showInputDialog(title, prompt, defaultValue string) (string, bool) {
+	// Reset dialog state.
+	inputResult = defaultValue
+	inputOK = false
+	inputDone = false
+
+	hInstance, _, _ := getModuleHandle.Call(0)
+
+	// Register the dialog window class (errors are ignored; re-registration is harmless).
+	dialogClassName, _ := syscall.UTF16PtrFromString("ThemeInputDialogClass")
+	wc := WNDCLASS{
+		LpfnWndProc:   inputDialogWndProc,
+		HInstance:     syscall.Handle(hInstance),
+		LpszClassName: dialogClassName,
+	}
+	registerClass.Call(uintptr(unsafe.Pointer(&wc)))
+
+	// Center dialog on screen.
+	const dlgW, dlgH = 310, 135
+	screenW, _, _ := getSystemMetrics.Call(0) // SM_CXSCREEN
+	screenH, _, _ := getSystemMetrics.Call(1) // SM_CYSCREEN
+	x := (int(screenW) - dlgW) / 2
+	y := (int(screenH) - dlgH) / 2
+
+	// WS_POPUP | WS_CAPTION | WS_SYSMENU = 0x80C80000
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	dlgHwnd, _, _ := createWindowEx.Call(
+		WS_EX_TOPMOST,
+		uintptr(unsafe.Pointer(dialogClassName)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		0x80C80000,
+		uintptr(x), uintptr(y), dlgW, dlgH,
+		0, 0, hInstance, 0,
+	)
+	if dlgHwnd == 0 {
+		return defaultValue, false
+	}
+
+	// Static text label. WS_CHILD | WS_VISIBLE = 0x50000000
+	staticClass, _ := syscall.UTF16PtrFromString("STATIC")
+	promptPtr, _ := syscall.UTF16PtrFromString(prompt)
+	createWindowEx.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(promptPtr)),
+		0x50000000,
+		10, 15, 280, 20,
+		dlgHwnd, 0, hInstance, 0,
+	)
+
+	// Edit control. WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL = 0x50010080
+	editClass, _ := syscall.UTF16PtrFromString("EDIT")
+	defaultPtr, _ := syscall.UTF16PtrFromString(defaultValue)
+	editHwnd, _, _ := createWindowEx.Call(
+		WS_EX_CLIENTEDGE,
+		uintptr(unsafe.Pointer(editClass)),
+		uintptr(unsafe.Pointer(defaultPtr)),
+		0x50010080,
+		10, 43, 280, 24,
+		dlgHwnd, 0, hInstance, 0,
+	)
+	inputEditHwnd = syscall.Handle(editHwnd)
+
+	// OK button (BS_DEFPUSHBUTTON). WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON = 0x50010001
+	buttonClass, _ := syscall.UTF16PtrFromString("BUTTON")
+	okText, _ := syscall.UTF16PtrFromString("OK")
+	createWindowEx.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(okText)),
+		0x50010001,
+		75, 82, 70, 24,
+		dlgHwnd, ID_DIALOG_OK, hInstance, 0,
+	)
+
+	// Cancel button. WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON = 0x50010000
+	cancelText, _ := syscall.UTF16PtrFromString("Cancel")
+	createWindowEx.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(cancelText)),
+		0x50010000,
+		160, 82, 70, 24,
+		dlgHwnd, ID_DIALOG_CANCEL, hInstance, 0,
+	)
+
+	showWindow.Call(dlgHwnd, SW_SHOW)
+	setFocus.Call(uintptr(inputEditHwnd))
+
+	// Run a nested message loop until the dialog is dismissed.
+	// IsDialogMessage handles Tab navigation and Enter (triggers default button).
+	var msg MSG
+	for !inputDone {
+		ret, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if ret == 0 || ret == 0xFFFFFFFF {
+			break
+		}
+		r, _, _ := isDialogMessage.Call(dlgHwnd, uintptr(unsafe.Pointer(&msg)))
+		if r != 0 {
+			continue
+		}
+		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+
+	return inputResult, inputOK
+}
 
 func getClockTime(tz string) string {
 	t := time.Now()
