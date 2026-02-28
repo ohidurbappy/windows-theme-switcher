@@ -70,8 +70,12 @@ const (
 	SW_SHOW = 5
 
 	// Window extended styles
-	WS_EX_CLIENTEDGE = 0x00000200
-	WS_EX_TOPMOST    = 0x00000008
+	WS_EX_CLIENTEDGE    = 0x00000200
+	WS_EX_TOPMOST       = 0x00000008
+	WS_EX_DLGMODALFRAME = 0x00000001
+
+	// System color brush for dialog background (COLOR_BTNFACE + 1)
+	COLOR_BTNFACE_BRUSH = 16
 
 	// Schedule registry key (HKCU)
 	REGKEY_SCHEDULE = `Software\WindowsThemeSwitcher`
@@ -112,6 +116,7 @@ var (
 	getWindowTextW                = user32.NewProc("GetWindowTextW")
 	destroyWindow                 = user32.NewProc("DestroyWindow")
 	setFocus                      = user32.NewProc("SetFocus")
+	enableWindow                  = user32.NewProc("EnableWindow")
 	isDialogMessage               = user32.NewProc("IsDialogMessage")
 	getSystemMetrics              = user32.NewProc("GetSystemMetrics")
 )
@@ -176,6 +181,9 @@ var (
 	// inputDialogWndProc is the Windows callback for the input dialog window.
 	// It must be created once at package level (syscall.NewCallback limit).
 	inputDialogWndProc = syscall.NewCallback(inputDialogProc)
+
+	// inputDialogActive prevents re-entrant calls to showInputDialog.
+	inputDialogActive bool
 )
 
 func main() {
@@ -848,6 +856,13 @@ func inputDialogProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) ui
 // It returns the entered text and true on OK, or (defaultValue, false) on Cancel.
 // Must be called from the main GUI thread.
 func showInputDialog(title, prompt, defaultValue string) (string, bool) {
+	// Prevent re-entrant calls that would corrupt shared dialog state.
+	if inputDialogActive {
+		return defaultValue, false
+	}
+	inputDialogActive = true
+	defer func() { inputDialogActive = false }()
+
 	// Reset dialog state.
 	inputResult = defaultValue
 	inputOK = false
@@ -856,16 +871,18 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 	hInstance, _, _ := getModuleHandle.Call(0)
 
 	// Register the dialog window class (errors are ignored; re-registration is harmless).
+	// HbrBackground is set so the dialog background is properly painted.
 	dialogClassName, _ := syscall.UTF16PtrFromString("ThemeInputDialogClass")
 	wc := WNDCLASS{
 		LpfnWndProc:   inputDialogWndProc,
 		HInstance:     syscall.Handle(hInstance),
+		HbrBackground: syscall.Handle(COLOR_BTNFACE_BRUSH),
 		LpszClassName: dialogClassName,
 	}
 	registerClass.Call(uintptr(unsafe.Pointer(&wc)))
 
 	// Center dialog on screen.
-	const dlgW, dlgH = 310, 135
+	const dlgW, dlgH = 380, 160
 	screenW, _, _ := getSystemMetrics.Call(0) // SM_CXSCREEN
 	screenH, _, _ := getSystemMetrics.Call(1) // SM_CYSCREEN
 	x := (int(screenW) - dlgW) / 2
@@ -874,16 +891,20 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 	// WS_POPUP | WS_CAPTION | WS_SYSMENU = 0x80C80000
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	dlgHwnd, _, _ := createWindowEx.Call(
-		WS_EX_TOPMOST,
+		WS_EX_TOPMOST|WS_EX_DLGMODALFRAME,
 		uintptr(unsafe.Pointer(dialogClassName)),
 		uintptr(unsafe.Pointer(titlePtr)),
 		0x80C80000,
 		uintptr(x), uintptr(y), dlgW, dlgH,
-		0, 0, hInstance, 0,
+		uintptr(hwnd), 0, hInstance, 0,
 	)
 	if dlgHwnd == 0 {
 		return defaultValue, false
 	}
+
+	// Disable the parent window to enforce modal behaviour and prevent a second
+	// context-menu interaction from re-entering this function.
+	enableWindow.Call(uintptr(hwnd), 0)
 
 	// Static text label. WS_CHILD | WS_VISIBLE = 0x50000000
 	staticClass, _ := syscall.UTF16PtrFromString("STATIC")
@@ -893,7 +914,7 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 		uintptr(unsafe.Pointer(staticClass)),
 		uintptr(unsafe.Pointer(promptPtr)),
 		0x50000000,
-		10, 15, 280, 20,
+		12, 18, 348, 20,
 		dlgHwnd, 0, hInstance, 0,
 	)
 
@@ -905,7 +926,7 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 		uintptr(unsafe.Pointer(editClass)),
 		uintptr(unsafe.Pointer(defaultPtr)),
 		0x50010080,
-		10, 43, 280, 24,
+		12, 46, 348, 26,
 		dlgHwnd, 0, hInstance, 0,
 	)
 	inputEditHwnd = syscall.Handle(editHwnd)
@@ -918,7 +939,7 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 		uintptr(unsafe.Pointer(buttonClass)),
 		uintptr(unsafe.Pointer(okText)),
 		0x50010001,
-		75, 82, 70, 24,
+		195, 92, 80, 28,
 		dlgHwnd, ID_DIALOG_OK, hInstance, 0,
 	)
 
@@ -929,7 +950,7 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 		uintptr(unsafe.Pointer(buttonClass)),
 		uintptr(unsafe.Pointer(cancelText)),
 		0x50010000,
-		160, 82, 70, 24,
+		285, 92, 80, 28,
 		dlgHwnd, ID_DIALOG_CANCEL, hInstance, 0,
 	)
 
@@ -941,7 +962,10 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 	var msg MSG
 	for !inputDone {
 		ret, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if ret == 0 || ret == 0xFFFFFFFF {
+		if ret == 0 { // WM_QUIT – repost so the outer message loop can exit cleanly
+			postQuitMessage.Call(msg.WParam)
+			break
+		} else if ret == 0xFFFFFFFF { // Error
 			break
 		}
 		r, _, _ := isDialogMessage.Call(dlgHwnd, uintptr(unsafe.Pointer(&msg)))
@@ -951,6 +975,9 @@ func showInputDialog(title, prompt, defaultValue string) (string, bool) {
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
+
+	// Re-enable parent window now that the dialog has been dismissed.
+	enableWindow.Call(uintptr(hwnd), 1)
 
 	return inputResult, inputOK
 }
