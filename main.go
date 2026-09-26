@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -119,7 +120,21 @@ var (
 	enableWindow                  = user32.NewProc("EnableWindow")
 	isDialogMessage               = user32.NewProc("IsDialogMessage")
 	getSystemMetrics              = user32.NewProc("GetSystemMetrics")
+	registerWindowMessage         = user32.NewProc("RegisterWindowMessageW")
 )
+
+// wmTaskbarCreated is broadcast by Explorer when the taskbar is (re)created,
+// e.g. after explorer.exe restarts. The tray icon must be re-added then.
+var wmTaskbarCreated uint32
+
+func init() {
+	// Win32 windows have thread affinity: messages for a window are only
+	// delivered to the OS thread that created it. The Go scheduler may move
+	// the main goroutine to another OS thread at any time, after which the
+	// message loop no longer receives the tray icon's messages and the icon
+	// stops responding. Pin the main goroutine to the main OS thread.
+	runtime.LockOSThread()
+}
 
 // NOTIFYICONDATA structure for Shell_NotifyIcon
 type NOTIFYICONDATA struct {
@@ -248,6 +263,10 @@ func initializeSystemTray() {
 		0,
 	)
 	hwnd = syscall.Handle(ret)
+
+	taskbarCreated, _ := syscall.UTF16PtrFromString("TaskbarCreated")
+	msgID, _, _ := registerWindowMessage.Call(uintptr(unsafe.Pointer(taskbarCreated)))
+	wmTaskbarCreated = uint32(msgID)
 
 	// Load icons from embedded data
 	lightIcon = createIconFromData(light_mode)
@@ -426,6 +445,10 @@ func showContextMenu() {
 }
 
 func windowProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
+	if wmTaskbarCreated != 0 && msg == wmTaskbarCreated {
+		createTrayIcon()
+		return 0
+	}
 	switch msg {
 	case WM_TRAYICON:
 		if lParam == WM_LBUTTONUP {
