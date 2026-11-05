@@ -32,6 +32,12 @@ const (
 	WM_SETTINGCHANGE = 0x001A
 	HWND_BROADCAST   = uintptr(0xFFFF)
 
+	// SendMessageTimeout flags
+	SMTO_ABORTIFHUNG = 0x0002
+
+	// Per-window timeout for the WM_SETTINGCHANGE broadcast, in milliseconds.
+	BROADCAST_TIMEOUT_MS = 1000
+
 	// System tray constants
 	NIM_ADD      = 0x00000000
 	NIM_MODIFY   = 0x00000001
@@ -93,7 +99,7 @@ var (
 	user32                        = windows.NewLazySystemDLL("user32.dll")
 	shell32                       = windows.NewLazySystemDLL("shell32.dll")
 	kernel32                      = windows.NewLazySystemDLL("kernel32.dll")
-	sendMessageW                  = user32.NewProc("SendMessageW")
+	sendMessageTimeoutW           = user32.NewProc("SendMessageTimeoutW")
 	UpdatePerUserSystemParameters = user32.NewProc("UpdatePerUserSystemParameters")
 	shellNotifyIcon               = shell32.NewProc("Shell_NotifyIconW")
 	createWindowEx                = user32.NewProc("CreateWindowExW")
@@ -642,21 +648,49 @@ func setTheme(themeMode uint32) {
 	notifyThemeChange()
 }
 
-// Function to notify the system about theme change
+// themeChangeRequests coalesces pending theme change broadcasts. It has a
+// buffer of one so that requests made while a broadcast is in progress
+// collapse into a single follow-up broadcast.
+var themeChangeRequests = make(chan struct{}, 1)
+
+func init() {
+	go themeChangeBroadcaster()
+}
+
+// notifyThemeChange asks the background broadcaster to notify the system about
+// the theme change. It never blocks, so it is safe to call from the GUI thread.
 func notifyThemeChange() {
-	// Convert wide string to UTF16 pointer
+	select {
+	case themeChangeRequests <- struct{}{}:
+	default:
+		// A broadcast is already pending; it will pick up the new theme.
+	}
+}
+
+// themeChangeBroadcaster runs the WM_SETTINGCHANGE broadcast off the GUI thread.
+// A broadcast has to wait for every top-level window in the session, so it can
+// take long or stall on hung windows. Running it on the GUI thread would freeze
+// the tray icon until it completes.
+func themeChangeBroadcaster() {
 	winStr, _ := syscall.UTF16PtrFromString("ImmersiveColorSet")
+	for range themeChangeRequests {
+		// A plain SendMessage to HWND_BROADCAST waits forever on any window
+		// that stops processing messages (e.g. a hung or suspended app).
+		// SendMessageTimeout skips hung windows and bounds the wait on others.
+		var result uintptr
+		sendMessageTimeoutW.Call(
+			HWND_BROADCAST,
+			WM_SETTINGCHANGE,
+			0,
+			uintptr(unsafe.Pointer(winStr)),
+			SMTO_ABORTIFHUNG,
+			BROADCAST_TIMEOUT_MS,
+			uintptr(unsafe.Pointer(&result)),
+		)
 
-	// Broadcast theme change message
-	sendMessageW.Call(
-		HWND_BROADCAST,
-		WM_SETTINGCHANGE,
-		0,
-		uintptr(unsafe.Pointer(winStr)),
-	)
-
-	// Update system parameters
-	UpdatePerUserSystemParameters.Call(1, 0)
+		// Update system parameters
+		UpdatePerUserSystemParameters.Call(1, 0)
+	}
 }
 
 func monitor(fn func(bool)) {
